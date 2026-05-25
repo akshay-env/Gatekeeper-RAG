@@ -1,0 +1,116 @@
+# Gatekeeper-RAG — Dev Log
+
+A running log of everything I built, broke, fixed, and decided along the way. Not a polished report — just honest notes so future-me (or anyone reading this) knows exactly what happened and why things are the way they are.
+
+---
+
+## May 25, 2026
+
+### Kicked off the project
+
+Started building **Gatekeeper-RAG** — the goal is an industry-grade RAG pipeline. Not a toy. I want something that actually works well enough to be production-worthy: proper ingestion, smart retrieval, clean generation, and honest evaluation.
+
+The data source I'm starting with is the FastAPI documentation (Markdown files). Good benchmark because it's real, structured, and has a mix of prose and code blocks.
+
+The stack I settled on:
+- **Qdrant** as the vector store (local for now, can move to cloud later)
+- **Gemini API** for embeddings — no need to host a model locally when Google's giving me access
+- **FastAPI** for the API layer (fitting, given the docs we're indexing)
+
+---
+
+### Ingestion pipeline — first pass
+
+Built out the three-stage ingestion pipeline: load → chunk → embed + store.
+
+**Loader** is simple — recursively walks a directory and reads all `.md` files. Nothing fancy, but it works.
+
+**Chunker** — I initially did the naive thing: split by words with a fixed window of 512 words and 50-word overlap. It ran, produced chunks, seemed fine on the surface. But the problem is obvious in hindsight — it completely ignores the fact that we're dealing with Markdown. It would happily split in the middle of a code block, cut across a heading boundary, or merge content from two completely unrelated sections. That's bad for retrieval quality because the chunks lose their semantic coherence.
+
+Fixed this properly — details below.
+
+**Embedder** — Originally wired up `BAAI/bge-large-en-v1.5` running on local GPU. Good model, 1024-dim embeddings, works well. But it adds a hard GPU dependency and I'd rather keep the infra light. Switched to **Gemini's `text-embedding-004`** via API — 768-dim, solid quality, and I don't have to manage a local model.
+
+---
+
+### Problem: Hit Gemini embedding API rate limits
+
+When I first switched to the Gemini API for embeddings, I was calling `embed_content` once per chunk. Blew through the RPM limit almost immediately. Got rate limit errors, the pipeline crashed mid-run, and I had to restart from scratch (since `recreate_collection` wipes everything at the start).
+
+**Root cause:** I was making one API call per chunk instead of batching. With ~800+ chunks from the FastAPI docs, that's 800+ requests — way over the per-minute limit.
+
+**Fix:**
+- Bumped batch size to **100 texts per API call** — this is the practical ceiling for the embedding endpoint and means I'm getting maximum value out of each request
+- Added a **1.5-second sleep between batches** — keeps us well under the RPM ceiling even under heavy indexing loads
+- Added **exponential backoff with retry** (up to 5 attempts) so if we do get a transient rate limit error, the pipeline self-heals instead of crashing
+
+Net effect: the pipeline now runs reliably end-to-end, uses each API call to its maximum capacity, and handles transient failures gracefully.
+
+---
+
+### Problem: Naive word-level chunking is not good enough
+
+As mentioned above, the word-count-based chunker was splitting blindly through Markdown structure. Code blocks, headings, and paragraphs meant nothing to it.
+
+**Fix — switched to a two-pass markdown-aware chunker:**
+
+1. **First pass — `MarkdownHeaderTextSplitter`:** Splits the document along header boundaries (`#`, `##`, `###`, `####`). Each resulting section carries its full header hierarchy as metadata (e.g., `h1: "Advanced Usage"`, `h2: "Dependency Injection"`). This means every chunk knows what section it belongs to, which is huge for retrieval quality.
+
+2. **Second pass — `RecursiveCharacterTextSplitter`:** Any section that's still too large gets recursively split, but this time along natural language boundaries — paragraph breaks first (`\n\n`), then line breaks, then sentence-ending punctuation, then words, and only then individual characters as a last resort. It never splits mid-sentence if it can avoid it.
+
+The chunk size is now **1000 characters** (not words) with **150 character overlap** — character-level sizing is more consistent across different content types and aligns better with how tokenizers actually work.
+
+Each chunk now also stores the header breadcrumb in its payload, which will be useful during retrieval to give the LLM structural context.
+
+---
+
+### Architecture decisions locked in (ingestion layer)
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| File format support | `.md` only | Starting focused; can add PDF/HTML later |
+| Chunking strategy | Markdown-header split → recursive character split | Preserves document structure and semantic coherence |
+| Embedding model | `text-embedding-004` via Gemini API | No local GPU dependency, solid quality, 768-dim |
+| Vector DB | Qdrant (local) | Easy to run, production-grade, good Python client |
+| Similarity metric | Cosine | Standard for normalized text embeddings |
+| Indexing mode | Full re-index per run | Acceptable for now; need incremental updates later |
+| Rate limiting | Batch=100, sleep=1.5s, retry w/ backoff | Reliable under API constraints |
+
+---
+
+*Next up: retrieval layer — vector search, query rewriting, and reranking.*
+
+---
+
+### Problem: `text-embedding-004` not available on this API key
+
+Ran the ingestion pipeline for the first time and hit a 404 immediately:
+
+```
+models/text-embedding-004 is not found for API version v1beta, or is not supported for embedContent.
+```
+
+Pulled the full list of models available on the key — `text-embedding-004` isn't there at all. The available embedding models are:
+
+- `models/gemini-embedding-001` — older, 768-dim
+- `models/gemini-embedding-2-preview` — preview
+- `models/gemini-embedding-2` — latest stable
+
+**Fix:** Switched to `models/gemini-embedding-2`. It's the best one available — higher quality and outputs 3072-dim vectors. Updated `EMBEDDING_DIM` to match. Qdrant collection will be created with the correct size on next run.
+
+---
+
+### Problem: Still hitting RPM limits with `gemini-embedding-2` free tier
+
+Got 300 chunks through (3 batches of 100) then hit a 429 RESOURCE_EXHAUSTED. The 1.5s sleep between batches was way too aggressive — the free tier for `gemini-embedding-2` is around 3-5 RPM, not the 1500 RPM I assumed.
+
+The retry logic made it worse — exponential backoff starting at 1s is useless for a per-minute quota. By the time we retried 5 times (1+2+4+8+16 = 31s total), we'd burned all retries and crashed, even though waiting 60s would have fixed it.
+
+**Fix — two changes:**
+
+1. **Sleep between batches: 1.5s → 15s** — caps us at ~4 requests/min, safely under the free tier limit
+2. **429-specific retry: wait 60s instead of exponential backoff** — a 429 means the quota window hasn't reset yet; waiting a full minute is the right move, not short retries
+
+The retry logic now distinguishes between rate limit errors (wait 60s, be patient) and actual errors (exponential backoff). Also bumped `MAX_RETRIES` to 8 since 429s aren't real failures — they just need time.
+
+

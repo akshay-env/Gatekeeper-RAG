@@ -113,4 +113,36 @@ The retry logic made it worse — exponential backoff starting at 1s is useless 
 
 The retry logic now distinguishes between rate limit errors (wait 60s, be patient) and actual errors (exponential backoff). Also bumped `MAX_RETRIES` to 8 since 429s aren't real failures — they just need time.
 
+---
+
+## May 26, 2026
+
+### Built the retrieval layer
+
+Ingestion is working. Today was the retrieval layer — the part that actually takes a user question and finds the right chunks from Qdrant.
+
+Built four files:
+
+**`retriever.py`** — Core vector search. Embeds the query using `task_type=RETRIEVAL_QUERY` (not `RETRIEVAL_DOCUMENT` — this matters, the model uses asymmetric encoding so query and document embeddings are comparable), then queries Qdrant. Also has `multi_retrieve()` which takes multiple query variants, searches for all of them, and deduplicates by text content keeping the highest score.
+
+**`query_rewriter.py`** — Two techniques here:
+1. **Query rewriting** — asks Gemini to strip filler words and make the query more keyword-focused and precise. Better for exact-match style retrieval.
+2. **HyDE (Hypothetical Document Embeddings)** — this is the more interesting one. Instead of embedding the question, we ask Gemini to write a fake-but-plausible documentation passage that would answer the question, then embed *that*. The insight from the HyDE paper (Gao et al. 2022) is that a fake answer lands in a much better part of the embedding space than the question itself. The question "how do I add middleware?" embeds near other questions; the fake answer embeds near actual middleware documentation.
+
+Both techniques feed into `expand_query()` which returns `[original_query, rewritten_query, hyde_passage]` — three search variants.
+
+**`reranker.py`** — LLM-as-judge reranking. After retrieving the top candidates from Qdrant, we send all of them to Gemini in a single call and ask it to score each one 0-10 for relevance. Then re-sort by those scores and return the top_n. This is more precise than cosine similarity because the model reads both the query and the chunk together — it can see *why* something is relevant, not just that the embeddings are close. Robust JSON parsing with markdown fence stripping, falls back to original vector scores if anything goes wrong.
+
+**`pipeline.py`** — Unified entry point. `search(query)` → query expansion → multi-retrieve → rerank → top chunks. The generator and API only call this, they don't need to know about the internals.
+
+### Architecture decisions (retrieval layer)
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Query embedding task type | `RETRIEVAL_QUERY` | Asymmetric encoding — must match `RETRIEVAL_DOCUMENT` used at index time |
+| Query expansion | Rewrite + HyDE | Improves recall, especially for imprecise questions |
+| Retrieval candidates | top_k=20 per variant | Cast a wide net before reranking narrows it down |
+| Reranking | LLM-as-judge (Gemini) | No local cross-encoder dependency; single API call for all chunks |
+| Final output | top_n=5 | Enough context without flooding the generator prompt |
+
 

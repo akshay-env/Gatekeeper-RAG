@@ -224,4 +224,42 @@ The `recreate_collection` call was replaced with `_ensure_collection()` (create 
 
 Net effect: re-running `run.py` after an interrupted run will now pick up from chunk 30 (or wherever it stopped) instead of starting over from 0.
 
+---
+
+## May 28, 2026
+
+### Built the API layer
+
+Today was the FastAPI server — the surface that makes the pipeline callable over HTTP.
+
+**`api/main.py`** — three endpoints:
+
+- `POST /ask` — the main one. Takes a query + optional params (`top_k`, `top_n`, `use_hyde`, `use_rerank`), runs the full pipeline, returns `{ answer, sources, chunks_used, model, processing_time_s }`. Returns 503 if Qdrant is empty (no data indexed yet), 500 on pipeline errors.
+
+- `GET /health` — liveness check. Pings Qdrant, returns connection status and chunk count. Useful for monitoring and as a pre-flight check before sending real queries.
+
+- `GET /stats` — returns current model config and index size. Handy for knowing exactly what's running without digging into the code.
+
+All request/response shapes are Pydantic models, so FastAPI auto-generates OpenAPI docs at `/docs`. Added CORS middleware so a frontend can call it later without browser issues.
+
+Startup prints a clear warning if Qdrant is empty — saves confusion when the index hasn't been populated yet.
+
+### Architecture decisions (API layer)
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Framework | FastAPI | Already a dependency (we're indexing FastAPI docs), async, auto-docs |
+| Request validation | Pydantic models | Type-safe, auto-validated, shows up in OpenAPI docs |
+| CORS | Allow all origins | Development mode — will tighten in production |
+| Error on empty index | 503 Service Unavailable | Correct HTTP semantics — service exists but not ready |
+| Processing time | Included in response | Useful for benchmarking retrieval vs generation latency |
+
+### How to run
+
+```
+uvicorn api.main:app --reload --port 8000
+```
+Then open `http://localhost:8000/docs` for the interactive API docs.
+
+
 

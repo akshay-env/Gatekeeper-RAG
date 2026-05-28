@@ -261,5 +261,42 @@ uvicorn api.main:app --reload --port 8000
 ```
 Then open `http://localhost:8000/docs` for the interactive API docs.
 
+---
+
+## May 29, 2026
+
+### Built the evaluation layer
+
+With ingestion, retrieval, generation, and the API all done, the last piece is knowing whether any of it actually works — and how well. Evaluation is the difference between a demo that looks good and a system you can actually trust.
+
+Built two files:
+
+**`evaluation/testset.py`** — testset generator. Pulls a random sample of chunks from Qdrant, sends each one to Gemini and asks it to generate a realistic developer question + correct answer from that chunk. Saves everything to `testset.json` so we don't have to regenerate it every time. Each test case includes the question, the ground truth answer, the source chunk it came from, and the breadcrumb.
+
+**`evaluation/metrics.py`** — four RAGAS-style metrics, all scored with Gemini LLM-as-judge:
+
+1. **Faithfulness** — takes every factual claim in the answer and checks whether it's supported by the retrieved context. Score = supported_claims / total_claims. This is the anti-hallucination metric.
+
+2. **Answer Relevance** — asks Gemini to rate 0-10 how well the answer actually addresses the question. Normalised to 0-1.
+
+3. **Context Recall** — for each sentence in the ground truth answer, checks if the retrieved context contains the information needed to produce it. Score = attributable_sentences / total_sentences. Low recall means retrieval is missing relevant chunks.
+
+4. **Context Precision** — for each retrieved chunk, checks whether it was actually useful for answering the question. Score = useful_chunks / total_chunks. Low precision means retrieval is pulling in noise.
+
+The `evaluate()` function runs all four metrics across the test set and prints a formatted table with per-case scores and column means.
+
+I chose LLM-as-judge over traditional NLP metrics (BLEU, ROUGE, etc.) because they're meaningless for RAG. ROUGE measures n-gram overlap, not factual grounding — an answer that's worded differently but semantically correct would score terribly. Gemini can actually understand what's supported and what isn't.
+
+### Architecture decisions (evaluation layer)
+
+| Decision | Choice | Reasoning |
+|---|---|---|
+| Metric framework | Custom, RAGAS-inspired | No external dependencies, full control over prompts |
+| Scoring model | Gemini LLM-as-judge | Better semantic understanding than ROUGE/BLEU |
+| Testset generation | LLM from real chunks | Realistic questions grounded in actual documentation |
+| Testset persistence | JSON file | Generate once, reuse across evaluation runs |
+| Rate limit handling | 3-5s sleeps between calls | Multiple Gemini calls per test case — need to pace carefully |
+
+
 
 
